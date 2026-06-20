@@ -1,0 +1,9 @@
+# Generated runtime config (build with `make`)
+opensips.cfg
+
+# Never commit private keys / certificates
+tls/*.pem
+tls/*.crt
+tls/*.key
+tls/*.p12
+tls/*.pfx
