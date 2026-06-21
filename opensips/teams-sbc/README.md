@@ -50,21 +50,38 @@ rotation sidecar).
 | `scripts/create-tenant.sh`        | Provision a tenant (can send to / receive from Teams).       |
 | `tls-rotation/`                   | DB cert management + automatic ACME rotation.                |
 | `rtpengine/rtpengine.conf`        | Sample rtpengine config (compose uses CLI flags).            |
-| `opensips.cfg`, `.env`, `tls-rotation/rotation.conf` | generated / secret — git-ignored.         |
+| `.env.sbc1.dev.example` / `.env.sbc1.prod.example` | per-instance/env templates.            |
+| `scripts/sbc.sh`                  | run compose for a given instance+env.                        |
+| `opensips.cfg`, `.env.*`, `tls-rotation/rotation.conf` | generated / secret — git-ignored.       |
 
 ---
 
 ## Quick start (Docker Compose)
 
+Each SBC instance + environment has its own env file: `.env.sbc1.dev`,
+`.env.sbc1.prod`, `.env.sbc2.dev`, … `local.m4` reads every value from the
+environment, so the **same image serves any instance/env** — no per-instance
+config edits.
+
 ```bash
 cd opensips/teams-sbc
-cp docker/.env.example .env            # DB password, MEDIA_IP, CORE_IPS_FQDN, ACME creds
+cp .env.sbc1.dev.example .env.sbc1.dev     # set IPs, FQDNs, DB password, ACME creds
 cp tls-rotation/rotation.conf.example tls-rotation/rotation.conf
-# edit local.m4: M_TEAMS_TLS_*_IP, M_CORE_*_IP, M_CORE_FQDN (dev vs prod)
 
-docker compose up -d --build
-docker compose logs -f opensips        # watch the bootstrap + start
+scripts/sbc.sh sbc1 dev up -d --build      # bring up the sbc1/dev instance
+scripts/sbc.sh sbc1 dev logs -f opensips   # watch the bootstrap + start
 ```
+
+`scripts/sbc.sh <instance> <dev|prod> <args…>` wraps
+`docker compose --env-file .env.<instance>.<env> …`. Each env file sets
+`COMPOSE_PROJECT_NAME` and `ENV_FILE`, so instances get unique containers/volumes
+and the file is injected into the containers.
+
+> Add more: `cp .env.sbc1.prod.example .env.sbc2.prod`, edit it
+> (`COMPOSE_PROJECT_NAME`, `SBC_INSTANCE`, IPs/FQDNs), then
+> `scripts/sbc.sh sbc2 prod up -d`. Co-locating instances on **one host**
+> requires distinct `TEAMS_TLS_*_IP` / `CORE_*` / `MEDIA_IP` and distinct
+> `DB_PORT` / `MI_HTTP_PORT`.
 
 On **first boot** the opensips container detects there is no certificate yet,
 **generates a self-signed one** (covering the wildcard/base FQDNs) and loads it
@@ -74,7 +91,7 @@ obtains real ACME certificates and keeps the core IP list current.
 ### Add a tenant
 
 ```bash
-docker compose exec opensips \
+scripts/sbc.sh sbc1 dev exec opensips \
   /etc/opensips/teams-sbc/scripts/create-tenant.sh acme.teams.ucp.voiceland.dev
 ```
 
@@ -84,20 +101,27 @@ hot-reloads. The next ACME rotation issues a trusted certificate.
 
 ---
 
-## Configure `local.m4`
+## Configuration (environment variables)
 
-| Variable                          | Meaning                                                    |
+`local.m4` reads every value via `M_ENV(NAME, DEFAULT)` (m4 `esyscmd`), so all
+configuration is environment-driven — set in the instance env file
+(`.env.sbcX.dev` / `.env.sbcX.prod`) for Docker, or exported for a bare
+`make`/standalone build. The full list with defaults is in
+`.env.sbc1.dev.example`. Key ones:
+
+| Env var                           | Meaning                                                    |
 |-----------------------------------|------------------------------------------------------------|
-| `M_TEAMS_TLS_LISTEN_IP` / `…_ADVERTISED_IP` | bind IP vs. public IP for the Teams TLS leg.    |
-| `M_CORE_FQDN` / `M_CORE_PORT` / `M_CORE_TRANSPORT` | core destination (eu.ucp.voiceland.X:5560/tcp). |
-| `M_CORE_LISTEN_IP` / `…_ADVERTISED_IP` / `M_CORE_SIP_PORT` | SBC core-facing socket.        |
-| `M_CORE_GROUP`                    | `address` table group for trusted core IPs (default 1).    |
-| `M_DB_URL` / `M_DB_MODULE`        | database connection (tls_mgm, permissions, sqlops).        |
-| `M_MI_HTTP_IP` / `M_MI_HTTP_PORT` | MI HTTP endpoint used by the sidecar (127.0.0.1:8888).     |
-| `M_RTPENGINE_SOCK`                | rtpengine ng control socket.                               |
+| `TEAMS_TLS_LISTEN_IP` / `TEAMS_TLS_ADVERTISED_IP` | bind vs. public IP for the Teams TLS leg.  |
+| `CORE_FQDN` / `CORE_PORT` / `CORE_TRANSPORT` | core destination (eu.ucp.voiceland.X:5560/tcp).  |
+| `CORE_LISTEN_IP` / `CORE_ADVERTISED_IP` / `CORE_SIP_PORT` | SBC core-facing socket.         |
+| `CORE_IPS_FQDN`                   | DNS name resolved every 5 min for the trusted core IPs.    |
+| `DB_HOST/PORT/USER/PASS/NAME`     | database (also `DB_PORT` = host-published MariaDB port).   |
+| `MI_HTTP_IP` / `MI_HTTP_PORT` / `MI_URL` | MI HTTP endpoint (sidecar reload).                  |
+| `MEDIA_IP` / `RTP_PORT_MIN/MAX`   | rtpengine media address + port range.                      |
+| `DEPLOY_ENV` / `SBC_INSTANCE`     | labels for logs / bootstrap.                               |
 
-The **core discovery FQDN** for the 5-minute refresh is `CORE_IPS_FQDN` in
-`.env` (sidecar), not in `local.m4`.
+Outside Docker, any unset variable falls back to the default baked into
+`local.m4`, so `make` still produces a working `opensips.cfg`.
 
 ---
 

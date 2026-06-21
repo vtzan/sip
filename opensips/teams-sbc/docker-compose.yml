@@ -1,17 +1,19 @@
 # ============================================================================
 #  OpenSIPS 3.6 Microsoft Teams SBC -- Docker Compose
 #
-#  Services: mysql (MariaDB), opensips, rtpengine, sidecar (cert rotation +
-#  5-minute core-IP refresh). opensips/rtpengine/sidecar use host networking so
-#  TLS :5560 and the RTP media range bind real host addresses; MySQL stays on a
-#  private bridge and only publishes 3306 on 127.0.0.1.
+#  Per-instance / per-environment configuration lives in an env file selected at
+#  run time:  .env.sbc1.dev , .env.sbc1.prod , .env.sbc2.dev , ...
+#  Each env file sets ENV_FILE (its own path) and COMPOSE_PROJECT_NAME so
+#  containers/volumes stay unique, and is injected into the containers (env_file
+#  below) so local.m4 / the entrypoint pick up the instance's values.
 #
-#  Quick start:
-#    cp docker/.env.example .env        # set IPs, FQDNs, DB password, ACME creds
-#    # edit local.m4 with your real IPs (M_TEAMS_TLS_*_IP, M_CORE_*_IP)
-#    docker compose up -d --build
-#  On first boot the opensips container self-signs a certificate so it can start;
-#  the sidecar then obtains real ACME certs and refreshes the core IPs.
+#  Run an instance:
+#    scripts/sbc.sh sbc1 dev up -d --build
+#    # == docker compose --env-file .env.sbc1.dev up -d --build
+#
+#  opensips/rtpengine/sidecar use host networking; MariaDB publishes only on
+#  127.0.0.1:${DB_PORT}. Co-locating multiple instances on ONE host requires
+#  distinct IPs/ports (DB_PORT, MI_HTTP_PORT, TEAMS_TLS_*_IP, CORE_*, MEDIA_IP).
 # ============================================================================
 services:
   mysql:
@@ -23,7 +25,7 @@ services:
       MARIADB_PASSWORD: ${DB_PASS:-opensipsrw}
       MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASS:-change-me-root}
     ports:
-      - "127.0.0.1:3306:3306"
+      - "127.0.0.1:${DB_PORT:-3306}:3306"
     volumes:
       - mysql-data:/var/lib/mysql
     healthcheck:
@@ -42,15 +44,10 @@ services:
     depends_on:
       mysql:
         condition: service_healthy
-    environment:
-      DB_HOST: 127.0.0.1
-      DB_PORT: "3306"
-      DB_USER: ${DB_USER:-opensips}
-      DB_PASS: ${DB_PASS:-opensipsrw}
-      DB_NAME: ${DB_NAME:-opensips}
-      MI_URL: http://127.0.0.1:8888/mi
-      BOOTSTRAP_CN: ${BOOTSTRAP_CN:-sbc.teams.ucp.voiceland.dev}
-      BOOTSTRAP_SANS: ${BOOTSTRAP_SANS:-DNS:*.teams.ucp.voiceland.dev,DNS:*.teams.ucp.voiceland.global,DNS:eu.ucp.voiceland.dev,DNS:eu.ucp.voiceland.global,DNS:sbc.teams.ucp.voiceland.dev}
+    # Inject the selected instance/env file into the container (drives local.m4
+    # via the entrypoint's m4 build and the bootstrap).
+    env_file:
+      - ${ENV_FILE:-.env}
     volumes:
       - .:/etc/opensips/teams-sbc
 
@@ -76,22 +73,9 @@ services:
     depends_on:
       - opensips
     entrypoint: ["/etc/opensips/teams-sbc/docker/sidecar-entrypoint.sh"]
-    # pull DNS-provider secrets (e.g. CLOUDFLARE_DNS_API_TOKEN) through to lego
+    # same instance/env file -> DB creds, MI_URL, CORE_IPS_FQDN, ACME secrets
     env_file:
-      - .env
-    environment:
-      DB_HOST: 127.0.0.1
-      DB_PORT: "3306"
-      DB_USER: ${DB_USER:-opensips}
-      DB_PASS: ${DB_PASS:-opensipsrw}
-      DB_NAME: ${DB_NAME:-opensips}
-      MI_URL: http://127.0.0.1:8888/mi
-      CORE_GROUP: "1"
-      CORE_IPS_FQDN: ${CORE_IPS_FQDN:-eu.ucp.voiceland.dev}
-      ROTATE_INTERVAL: ${ROTATE_INTERVAL:-86400}
-      ACME_EMAIL: ${ACME_EMAIL:-tls@voiceland.dev}
-      ACME_DNS_PROVIDER: ${ACME_DNS_PROVIDER:-cloudflare}
-      LEGO_PATH: /var/lib/lego
+      - ${ENV_FILE:-.env}
     volumes:
       - .:/etc/opensips/teams-sbc
       - lego-data:/var/lib/lego

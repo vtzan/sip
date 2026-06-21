@@ -20,6 +20,9 @@ echo "[entrypoint] applying schema + base rows"
 "${MYSQL[@]}" < "$SBC/sql/01-schema.sql"
 "${MYSQL[@]}" < "$SBC/sql/02-seed-example.sql"
 
+# Keep the TLS server domain's match address in sync with this instance's IP.
+"${MYSQL[@]}" -e "UPDATE tls_mgm SET match_ip_address='${TEAMS_TLS_LISTEN_IP:-10.0.0.10}:${TEAMS_TLS_PORT:-5560}' WHERE domain='teams_srv' AND type=2;"
+
 HAS=$("${MYSQL[@]}" -N -B -e \
     "SELECT certificate IS NOT NULL FROM tls_mgm WHERE domain='teams_srv' AND type=2" 2>/dev/null || echo "")
 if [ "$HAS" != "1" ]; then
@@ -29,8 +32,11 @@ else
     echo "[entrypoint] server certificate already present, skipping bootstrap"
 fi
 
-echo "[entrypoint] building opensips.cfg"
-make -C "$SBC" >/dev/null
+# Build to a container-local path (NOT the bind-mounted source dir) so multiple
+# instances sharing the same checkout never clobber each other's opensips.cfg.
+OUT=/etc/opensips/opensips.cfg
+echo "[entrypoint] building $OUT (instance=${SBC_INSTANCE:-sbc1} env=${DEPLOY_ENV:-dev})"
+m4 -P "$SBC/local.m4" "$SBC/opensips.m4" > "$OUT"
 
 echo "[entrypoint] starting OpenSIPS"
-exec opensips -F -f "$SBC/opensips.cfg"
+exec opensips -F -f "$OUT"

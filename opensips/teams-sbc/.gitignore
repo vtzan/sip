@@ -1,9 +1,12 @@
 # Generated runtime config (build with `make`)
 opensips.cfg
 
-# Compose / rotation secrets
+# Compose / rotation secrets (per-instance env files + the rotation config)
 .env
+.env.sbc*.dev
+.env.sbc*.prod
 tls-rotation/rotation.conf
+!*.example
 
 # Never commit private keys / certificates / ACME state
 tls/*.pem
