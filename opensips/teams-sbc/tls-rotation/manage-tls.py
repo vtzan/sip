@@ -41,13 +41,14 @@ def load_config(path):
 
 
 def db_connect(cfg):
+    # Environment variables (set by the containers) override the config file.
     db = cfg["db"]
     return pymysql.connect(
-        host=db.get("host", "127.0.0.1"),
-        port=db.getint("port", 3306),
-        user=db.get("user", "opensips"),
-        password=db.get("password", ""),
-        database=db.get("name", "opensips"),
+        host=os.environ.get("DB_HOST", db.get("host", "127.0.0.1")),
+        port=int(os.environ.get("DB_PORT", db.getint("port", 3306))),
+        user=os.environ.get("DB_USER", db.get("user", "opensips")),
+        password=os.environ.get("DB_PASS", db.get("password", "")),
+        database=os.environ.get("DB_NAME", db.get("name", "opensips")),
         autocommit=False,
     )
 
@@ -73,14 +74,33 @@ def now_utc():
     return datetime.datetime.now(datetime.timezone.utc)
 
 
-def reload_opensips(cfg):
+def mi_call(cfg, method):
+    """Invoke an OpenSIPS MI method via HTTP JSON-RPC (mi_url) or opensips-cli."""
+    mi_url = os.environ.get("MI_URL", cfg["rotation"].get("mi_url", "")).strip()
+    if mi_url:
+        import json
+        import urllib.request
+        body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": method}).encode()
+        req = urllib.request.Request(mi_url, data=body,
+                                     headers={"Content-Type": "application/json"})
+        print(f"  MI {method} -> {mi_url}")
+        try:
+            urllib.request.urlopen(req, timeout=5).read()
+            return True
+        except Exception as e:  # noqa: BLE001
+            print(f"  warning: MI call failed: {e}", file=sys.stderr)
+            return False
     cli = cfg["rotation"].get("opensips_cli", "opensips-cli")
-    cmd = cli.split() + ["-x", "mi", "tls_mgm:reload"]
+    cmd = cli.split() + ["-x", "mi", method]
     print(f"  reloading: {' '.join(cmd)}")
     rc = subprocess.run(cmd).returncode
     if rc != 0:
-        print(f"  warning: reload command exited {rc}", file=sys.stderr)
+        print(f"  warning: '{method}' exited {rc} (is OpenSIPS running yet?)", file=sys.stderr)
     return rc == 0
+
+
+def reload_opensips(cfg):
+    return mi_call(cfg, "tls_mgm:reload")
 
 
 def sans_for(cfg, domain_id, match_sip_domain):

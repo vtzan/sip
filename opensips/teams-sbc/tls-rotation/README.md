@@ -26,8 +26,12 @@ environment / systemd unit.
 
 ## One-time bootstrap
 
+In the Docker Compose deployment this is automatic: the opensips container
+applies the schema and self-signs a starter certificate on first boot, and the
+sidecar takes over rotation. For a manual/standalone setup:
+
 ```bash
-# 1. schema + seed (see ../sql)
+# 1. schema + base TLS rows (see ../sql)
 mysql opensips < ../sql/01-schema.sql
 mysql opensips < ../sql/02-seed-example.sql
 

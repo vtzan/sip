@@ -8,14 +8,17 @@
 #       make            (== m4 -P local.m4 opensips.m4 > opensips.cfg)
 #
 #  Topology:
-#       Microsoft Teams  <==TLS 5560, SRTP==>  [ OpenSIPS + rtpengine ]  <==RTP==>  carrier/core
+#    Microsoft Teams  <==TLS 5560, SRTP==>  [ OpenSIPS + rtpengine ]  <==TCP 5560, RTP==>  core
+#                                                                       eu.ucp.voiceland.{dev,global}
 #
-#  Highlights:
-#    * TLS (mutual) is served ONLY on port 5560 (Teams leg). No other TLS port.
-#    * Full multi-tenancy on <tenant>.teams.ucp.voiceland.dev / .global
-#    * rtpengine bridges Teams SRTP (RTP/SAVP) <-> carrier RTP (RTP/AVP)
-#    * Per-tenant FQDN is placed in the Teams-facing Contact and Record-Route,
-#      which is how Microsoft attributes the call to the correct trunk.
+#  Routing:
+#    * Teams  -> core : every call is relayed to the core FQDN:5560/TCP.
+#    * core   -> Teams: tenant = From-URI host (or P-Asserted-Identity host);
+#                       the tenant must exist in the `tls_mgm` table; then the
+#                       call is sent to the Microsoft pstnhub proxies.
+#    * Trusted core source IPs live in the `address` table and are refreshed
+#      from DNS every 5 minutes by the rotation sidecar.
+#    * All TLS certificates + tenant identities are managed in the database.
 # ============================================================================
 
 ####### Global Parameters #########
@@ -33,7 +36,7 @@ auto_aliases=no
 
 mpath="M_MODULES_PATH"
 
-####### Modules (load order matters: db_mysql + tls_mgm before proto_tls) #########
+####### Modules #########
 
 loadmodule "M_DB_MODULE"
 loadmodule "proto_udp.so"
@@ -47,72 +50,60 @@ loadmodule "rr.so"
 loadmodule "maxfwd.so"
 loadmodule "sipmsgops.so"
 loadmodule "uac.so"
-loadmodule "domain.so"
+loadmodule "permissions.so"
+loadmodule "sqlops.so"
 loadmodule "dialog.so"
 loadmodule "rtpengine.so"
-loadmodule "htable.so"
 loadmodule "mi_fifo.so"
+loadmodule "httpd.so"
+loadmodule "mi_http.so"
 
 ####### Module Parameters #########
 
-# ---- management interface ----
+# ---- management interfaces ----
 modparam("mi_fifo", "fifo_name", "M_FIFO_PATH")
+modparam("httpd", "ip", "M_MI_HTTP_IP")
+modparam("httpd", "port", M_MI_HTTP_PORT)
 
 # ---- transaction module ----
 modparam("tm", "fr_timeout", 5)
 modparam("tm", "fr_inv_timeout", 120)
 modparam("tm", "restart_fr_on_each_reply", 0)
-# make AVPs set in the request route visible inside onreply_route
 modparam("tm", "onreply_avp_mode", 1)
 
 # ---- record routing (SBC stays in the signalling path on both legs) ----
 modparam("rr", "append_fromtag", 1)
 modparam("rr", "enable_double_rr", 1)
 
-# ---- dialog tracking (call state, in-dialog routing, stats) ----
+# ---- dialog tracking ----
 modparam("dialog", "dlg_match_mode", 1)
 modparam("dialog", "default_timeout", 43200)
 
-# ---- From/PAI rewrite restoration on the carrier leg ----
+# ---- From/PAI rewrite restoration on the core leg ----
 modparam("uac", "restore_mode", "auto")
 
 # ---- rtpengine media relay ----
 modparam("rtpengine", "rtpengine_sock", "M_RTPENGINE_SOCK")
 modparam("rtpengine", "rtpengine_disable_tout", 20)
 
-# ---- in-memory map: carrier source IP -> tenant FQDN (outbound branding) ----
-modparam("htable", "htable", "carrier_src=>size=M_HTABLE_SIZE;")
+# ---- permissions: trusted core source IPs (refreshed from DNS every 5 min) ----
+modparam("permissions", "db_url", "M_DB_URL")
+modparam("permissions", "address_table", "M_ADDRESS_TABLE")
+
+# ---- sqlops: runtime tenant lookups against the tls_mgm table ----
+modparam("sqlops", "db_url", "M_DB_URL")
 
 # ---- TLS: ALL certificates/domains are managed in the database (tls_mgm) ----
-# Server + client TLS domains live in the `tls_mgm` table. Certificates, keys
-# and CA chains are stored as BLOBs and rotated by tls-rotation/manage-tls.py,
-# which hot-reloads them with:  opensips-cli -x mi tls_mgm:reload
+# Rotated by tls-rotation/manage-tls.py, hot-reloaded via MI tls_mgm:reload.
 modparam("tls_mgm", "tls_library", "openssl")
 modparam("tls_mgm", "db_url",   "M_DB_URL")
 modparam("tls_mgm", "db_table", "M_TLS_DB_TABLE")
 
-# ---- domain: the authoritative list of allowed tenant domains ----
-# Each tenant FQDN is a row in the `domain` table; its `attrs` column holds the
-# carrier trunk SIP URI used for inbound (Teams -> carrier) routing.
-# db_mode=1 caches the table; reload with:  opensips-cli -x mi domain:reload
-modparam("domain", "db_url",       "M_DB_URL")
-modparam("domain", "db_mode",      M_DOMAIN_DB_MODE)
-modparam("domain", "domain_table", "M_DOMAIN_TABLE")
-
 ####### Listening sockets #########
-# TLS is exposed ONLY on 5560 (Teams). Carrier leg is plain UDP/TCP on 5060.
+# TLS only on 5560 (Teams). Core leg is plain TCP (and UDP) towards eu.ucp.*.
 socket=tls:M_TEAMS_TLS_LISTEN_IP:M_TEAMS_TLS_PORT as M_TEAMS_TLS_ADVERTISED_IP:M_TEAMS_TLS_PORT
-socket=udp:M_CARRIER_LISTEN_IP:M_CARRIER_SIP_PORT as M_CARRIER_ADVERTISED_IP:M_CARRIER_SIP_PORT
-socket=tcp:M_CARRIER_LISTEN_IP:M_CARRIER_SIP_PORT as M_CARRIER_ADVERTISED_IP:M_CARRIER_SIP_PORT
-
-####### Startup: provision carrier source IPs #########
-# Tenant domains + inbound trunks live in the DB `domain` table.
-# Only the reverse map (carrier source IP -> tenant FQDN), used to brand
-# outbound calls towards Teams, is kept in this in-memory table.
-startup_route {
-	xlog("L_INFO", "[teams-sbc] provisioning carrier sources (env=M_DEPLOY_ENV, base=M_TEAMS_TENANT_BASE_DOMAIN)\n");
-	M_CARRIER_SRC_PROVISIONING
-}
+socket=tcp:M_CORE_LISTEN_IP:M_CORE_SIP_PORT as M_CORE_ADVERTISED_IP:M_CORE_SIP_PORT
+socket=udp:M_CORE_LISTEN_IP:M_CORE_SIP_PORT as M_CORE_ADVERTISED_IP:M_CORE_SIP_PORT
 
 ####### Main request routing #########
 route {
@@ -135,14 +126,11 @@ route {
 			if (is_method("BYE")) {
 				rtpengine_delete();
 			} else if (is_method("INVITE")) {
-				# re-INVITE / session refresh
 				route(INDIALOG_INVITE);
 			}
 			route(RELAY);
 		} else {
 			if (is_method("ACK")) {
-				# ACK for a locally generated negative reply, or for a 2xx
-				# whose transaction is still around
 				if (t_check_trans())
 					t_relay();
 				exit;
@@ -166,9 +154,9 @@ route {
 
 	# --- determine direction and bridge ---
 	if (route(IS_FROM_TEAMS)) {
-		route(FROM_TEAMS_TO_CARRIER);
-	} else if (route(IS_FROM_CARRIER)) {
-		route(FROM_CARRIER_TO_TEAMS);
+		route(FROM_TEAMS_TO_CORE);
+	} else if (route(IS_FROM_CORE)) {
+		route(FROM_CORE_TO_TEAMS);
 	} else {
 		xlog("L_WARN", "[teams-sbc] rejecting INVITE from untrusted source $si:$sp ($proto)\n");
 		send_reply(403, "Forbidden");
@@ -186,16 +174,16 @@ route[IS_FROM_TEAMS] {
 	return(-1);
 }
 
-route[IS_FROM_CARRIER] {
-	# Source IP is a provisioned carrier trunk.
-	if ($sht(carrier_src=>$si) != NULL)
+route[IS_FROM_CORE] {
+	# Source IP is a trusted core node (address table group M_CORE_GROUP,
+	# kept current by the 5-minute DNS refresh of M_CORE_IPS_FQDN).
+	if (check_source_address(M_CORE_GROUP))
 		return(1);
 	return(-1);
 }
 
 # ---------------------------------------------------------------------------
-#  OPTIONS keep-alive answered to Teams. Microsoft marks the trunk healthy when
-#  it receives a 200 OK whose Contact host is an FQDN (never a bare IP).
+#  OPTIONS keep-alive answered to Teams (FQDN Contact required by Microsoft).
 # ---------------------------------------------------------------------------
 route[TEAMS_OPTIONS_KEEPALIVE] {
 	append_to_reply("Contact: <sip:$rd:M_TEAMS_TLS_PORT;transport=tls>\r\n");
@@ -205,41 +193,30 @@ route[TEAMS_OPTIONS_KEEPALIVE] {
 }
 
 # ---------------------------------------------------------------------------
-#  INBOUND  :  Teams  -->  SBC  -->  carrier
+#  INBOUND  :  Teams  -->  SBC  -->  core (eu.ucp.voiceland.X:5560/TCP)
 # ---------------------------------------------------------------------------
-route[FROM_TEAMS_TO_CARRIER] {
-	# Tenant identity = host of the Request-URI (the tenant FQDN Microsoft sends
-	# to). Validate it against the DB `domain` table and pull the carrier trunk
-	# SIP URI from that domain's `attrs` column in one lookup.
-	if (!is_uri_host_local($var(trunk))) {
-		xlog("L_WARN", "[teams-sbc] inbound INVITE for non-local tenant domain $rd\n");
-		send_reply(404, "Unknown Tenant Domain");
-		exit;
-	}
-	if ($var(trunk) == NULL || $var(trunk) == "") {
-		xlog("L_WARN", "[teams-sbc] no trunk (domain.attrs) provisioned for tenant $rd\n");
-		send_reply(404, "Tenant Not Provisioned");
-		exit;
-	}
+route[FROM_TEAMS_TO_CORE] {
+	# Tenant FQDN that Microsoft addressed = host of the Request-URI; used only
+	# to brand the Teams-facing Record-Route. Every call goes to the core.
 	$avp(tenant_fqdn) = $rd;
-	$avp(direction) = "in";
+	$avp(direction)   = "in";
 
-	xlog("L_INFO", "[teams-sbc] IN  $ci tenant=$rd $fU -> $rU via $var(trunk)\n");
+	xlog("L_INFO", "[teams-sbc] IN  $ci tenant=$rd $fU -> $rU to core M_CORE_DST\n");
 
-	# Topology hiding: present the SBC carrier address as Contact.
+	# Topology hiding: present the SBC core address as Contact.
 	remove_hf("Contact");
-	append_hf("Contact: <sip:M_SBC_CONTACT_USER@M_CARRIER_ADVERTISED_IP:M_CARRIER_SIP_PORT>\r\n");
+	append_hf("Contact: <sip:M_SBC_CONTACT_USER@M_CORE_ADVERTISED_IP:M_CORE_SIP_PORT;transport=M_CORE_TRANSPORT>\r\n");
 
-	# Double Record-Route: outbound(carrier)=SBC IP, inbound(Teams)=tenant FQDN.
-	record_route_preset("M_CARRIER_ADVERTISED_IP:M_CARRIER_SIP_PORT",
+	# Double Record-Route: outbound(core)=SBC core, inbound(Teams)=tenant FQDN.
+	record_route_preset("M_CORE_ADVERTISED_IP:M_CORE_SIP_PORT;transport=M_CORE_TRANSPORT",
 	                    "$avp(tenant_fqdn):M_TEAMS_TLS_PORT;transport=tls");
 
-	# Media: Teams SRTP --> carrier RTP.
+	# Media: Teams SRTP --> core RTP.
 	if (has_body_part("application/sdp"))
-		rtpengine_offer("M_RTPENGINE_FLAGS_TO_CARRIER");
+		rtpengine_offer("M_RTPENGINE_FLAGS_TO_CORE");
 
-	$du = $var(trunk);
-	$fs = "M_CARRIER_FORCE_SOCKET";
+	$du = "M_CORE_DST";
+	$fs = "M_CORE_FORCE_SOCKET";
 
 	create_dialog();
 	$dlg_val(tenant_fqdn) = $avp(tenant_fqdn);
@@ -251,18 +228,17 @@ route[FROM_TEAMS_TO_CARRIER] {
 }
 
 # ---------------------------------------------------------------------------
-#  OUTBOUND :  carrier  -->  SBC  -->  Teams
+#  OUTBOUND :  core  -->  SBC  -->  Teams
 # ---------------------------------------------------------------------------
-route[FROM_CARRIER_TO_TEAMS] {
-	$avp(tenant_fqdn) = $sht(carrier_src=>$si);
-	$avp(direction)   = "out";
-
-	# The branded tenant FQDN must be an allowed domain (DB `domain` table).
-	if (!is_domain_local("$avp(tenant_fqdn)")) {
-		xlog("L_WARN", "[teams-sbc] carrier $si mapped to non-local tenant $avp(tenant_fqdn)\n");
-		send_reply(403, "Forbidden");
+route[FROM_CORE_TO_TEAMS] {
+	# Tenant identity comes from the From-URI host, else the P-Asserted-Identity
+	# host; it must exist in the tls_mgm table.
+	if (!route(RESOLVE_TENANT)) {
+		xlog("L_WARN", "[teams-sbc] core $si: no tls_mgm tenant for From=$fd / PAI\n");
+		send_reply(403, "Unknown Tenant");
 		exit;
 	}
+	$avp(direction) = "out";
 
 	xlog("L_INFO", "[teams-sbc] OUT $ci tenant=$avp(tenant_fqdn) $fU -> $rU to Teams\n");
 
@@ -275,15 +251,15 @@ route[FROM_CARRIER_TO_TEAMS] {
 		append_hf("P-Asserted-Identity: <sip:$fU@$avp(tenant_fqdn)>\r\n");
 
 	# SBC Contact MUST be the tenant FQDN: this is how Teams maps the call to
-	# the correct tenant trunk. Wildcard cert + DNS make every tenant FQDN valid.
+	# the correct tenant trunk.
 	remove_hf("Contact");
 	append_hf("Contact: <sip:M_SBC_CONTACT_USER@$avp(tenant_fqdn):M_TEAMS_TLS_PORT;transport=tls>\r\n");
 
-	# Double Record-Route: outbound(Teams)=tenant FQDN, inbound(carrier)=SBC IP.
+	# Double Record-Route: outbound(Teams)=tenant FQDN, inbound(core)=SBC core.
 	record_route_preset("$avp(tenant_fqdn):M_TEAMS_TLS_PORT;transport=tls",
-	                    "M_CARRIER_ADVERTISED_IP:M_CARRIER_SIP_PORT");
+	                    "M_CORE_ADVERTISED_IP:M_CORE_SIP_PORT;transport=M_CORE_TRANSPORT");
 
-	# Media: carrier RTP --> Teams SRTP.
+	# Media: core RTP --> Teams SRTP.
 	if (has_body_part("application/sdp"))
 		rtpengine_offer("M_RTPENGINE_FLAGS_TO_TEAMS");
 
@@ -299,6 +275,35 @@ route[FROM_CARRIER_TO_TEAMS] {
 	t_on_reply("MANAGE_REPLY");
 	t_on_failure("MANAGE_FAILURE");
 	route(RELAY);
+}
+
+# ---------------------------------------------------------------------------
+#  Resolve + validate the outbound tenant (From host, then PAI host) against
+#  the tls_mgm table. Sets $avp(tenant_fqdn) and returns 1 on success.
+# ---------------------------------------------------------------------------
+route[RESOLVE_TENANT] {
+	$var(cand) = $fd;
+	if (route(TENANT_EXISTS)) {
+		$avp(tenant_fqdn) = $var(cand);
+		return(1);
+	}
+	if (is_present_hf("P-Asserted-Identity")) {
+		$var(cand) = $(hdr(P-Asserted-Identity){nameaddr.uri}{uri.host});
+		if (route(TENANT_EXISTS)) {
+			$avp(tenant_fqdn) = $var(cand);
+			return(1);
+		}
+	}
+	return(-1);
+}
+
+route[TENANT_EXISTS] {
+	if ($var(cand) == NULL || $var(cand) == "")
+		return(-1);
+	if (sql_query("SELECT domain FROM M_TLS_DB_TABLE WHERE domain='$(var(cand){s.escape.common})' OR match_sip_domain='$(var(cand){s.escape.common})' LIMIT 1",
+	              "$avp(_tenant_chk)"))
+		return(1);
+	return(-1);
 }
 
 # ---------------------------------------------------------------------------
@@ -319,9 +324,9 @@ route[INDIALOG_INVITE] {
 			rtpengine_offer("M_RTPENGINE_FLAGS_TO_TEAMS");
 	} else {
 		remove_hf("Contact");
-		append_hf("Contact: <sip:M_SBC_CONTACT_USER@M_CARRIER_ADVERTISED_IP:M_CARRIER_SIP_PORT>\r\n");
+		append_hf("Contact: <sip:M_SBC_CONTACT_USER@M_CORE_ADVERTISED_IP:M_CORE_SIP_PORT;transport=M_CORE_TRANSPORT>\r\n");
 		if (has_body_part("application/sdp"))
-			rtpengine_offer("M_RTPENGINE_FLAGS_TO_CARRIER");
+			rtpengine_offer("M_RTPENGINE_FLAGS_TO_CORE");
 	}
 
 	t_on_reply("MANAGE_REPLY");
@@ -339,7 +344,7 @@ onreply_route[MANAGE_REPLY] {
 		if ($avp(direction) == "in")
 			rtpengine_answer("M_RTPENGINE_FLAGS_TO_TEAMS");
 		else
-			rtpengine_answer("M_RTPENGINE_FLAGS_TO_CARRIER");
+			rtpengine_answer("M_RTPENGINE_FLAGS_TO_CORE");
 	}
 
 	remove_hf("Contact");
@@ -347,20 +352,19 @@ onreply_route[MANAGE_REPLY] {
 		# reply heading to Teams -> tenant FQDN Contact
 		append_hf("Contact: <sip:M_SBC_CONTACT_USER@$avp(tenant_fqdn):M_TEAMS_TLS_PORT;transport=tls>\r\n");
 	} else {
-		# reply heading to carrier -> SBC carrier Contact
-		append_hf("Contact: <sip:M_SBC_CONTACT_USER@M_CARRIER_ADVERTISED_IP:M_CARRIER_SIP_PORT>\r\n");
+		# reply heading to core -> SBC core Contact
+		append_hf("Contact: <sip:M_SBC_CONTACT_USER@M_CORE_ADVERTISED_IP:M_CORE_SIP_PORT;transport=M_CORE_TRANSPORT>\r\n");
 	}
 }
 
 # ---------------------------------------------------------------------------
-#  Failure handling: Microsoft proxy fail-over for outbound calls, plus media
+#  Failure handling: Microsoft proxy fail-over for outbound calls + media
 #  tear-down once the call definitively fails.
 # ---------------------------------------------------------------------------
 failure_route[MANAGE_FAILURE] {
 	if (t_was_cancelled())
 		exit;
 
-	# Outbound: roll over to the next Microsoft proxy on timeout / 5xx.
 	if ($avp(direction) == "out" && t_check_status("(408|5[0-9][0-9])")) {
 		if (route(NEXT_TEAMS_PROXY)) {
 			t_on_reply("MANAGE_REPLY");
@@ -370,7 +374,6 @@ failure_route[MANAGE_FAILURE] {
 		}
 	}
 
-	# Give up: release the media session.
 	rtpengine_delete();
 }
 

@@ -1,7 +1,8 @@
 # Generated runtime config (build with `make`)
 opensips.cfg
 
-# Rotation config holds the DB password
+# Compose / rotation secrets
+.env
 tls-rotation/rotation.conf
 
 # Never commit private keys / certificates / ACME state

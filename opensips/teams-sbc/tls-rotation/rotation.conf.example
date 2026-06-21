@@ -1,5 +1,5 @@
-# Copy to rotation.conf and fill in. rotation.conf is git-ignored (it holds the
-# DB password). Used by manage-tls.py.
+# Copy to rotation.conf and fill in. rotation.conf is git-ignored (DB password).
+# Used by manage-tls.py and the rotation sidecar.
 
 [db]
 host     = 127.0.0.1
@@ -12,17 +12,18 @@ table    = tls_mgm
 [rotation]
 # Renew when the leaf certificate has this many days (or fewer) left.
 renew_threshold_days = 30
-# How manage-tls.py reaches OpenSIPS MI to hot-reload (opensips-cli must be
-# configured to talk to this instance via fifo or http).
+# How to reach OpenSIPS MI to hot-reload. Prefer mi_url (HTTP JSON-RPC) in
+# containers; otherwise leave it blank and set opensips_cli.
+mi_url       = http://127.0.0.1:8888/mi
 opensips_cli = opensips-cli
 
 [acme]
-# Hook that issues/renews a certificate for a set of SANs (see acme-hook.sh).
-hook = /opt/opensips-teams-sbc/tls-rotation/acme-hook.sh
+# Hook that issues/renews a cert for a set of SANs (see acme-hook.sh).
+hook = /etc/opensips/teams-sbc/tls-rotation/acme-hook.sh
 
 # Map a tls_mgm.domain id -> the SAN list to request for it.
-# Wildcards cover every tenant under a base domain with a single certificate.
-# (Rows that instead set tls_mgm.match_sip_domain are auto-issued for that FQDN.)
+# Rows that instead set tls_mgm.match_sip_domain (per-tenant) are auto-issued
+# for that FQDN, so they do not need an entry here.
 [map]
-teams_srv = *.teams.ucp.voiceland.dev,*.teams.ucp.voiceland.global,sbc.teams.ucp.voiceland.dev
+teams_srv = *.teams.ucp.voiceland.dev,*.teams.ucp.voiceland.global,eu.ucp.voiceland.dev,eu.ucp.voiceland.global,sbc.teams.ucp.voiceland.dev
 teams_cli = sbc.teams.ucp.voiceland.dev

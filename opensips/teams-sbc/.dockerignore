@@ -1,0 +1,9 @@
+opensips.cfg
+.env
+tls-rotation/rotation.conf
+tls/*.pem
+tls/*.crt
+tls/*.key
+**/lego/
+**/certificates/
+.git
