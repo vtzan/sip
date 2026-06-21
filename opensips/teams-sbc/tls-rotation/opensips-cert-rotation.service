@@ -1,0 +1,18 @@
+[Unit]
+Description=OpenSIPS Teams SBC - TLS certificate rotation (DB)
+After=network-online.target mariadb.service opensips.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=opensips
+Group=opensips
+WorkingDirectory=/opt/opensips-teams-sbc/tls-rotation
+# DNS-01 provider credentials for acme-hook.sh (lego). Adjust to your provider.
+Environment=ACME_EMAIL=tls@voiceland.dev
+Environment=ACME_DNS_PROVIDER=cloudflare
+Environment=LEGO_PATH=/var/lib/lego
+# Example provider secret (use systemd EnvironmentFile=/etc/opensips/acme.env in prod):
+# Environment=CLOUDFLARE_DNS_API_TOKEN=...
+ExecStart=/usr/bin/python3 /opt/opensips-teams-sbc/tls-rotation/manage-tls.py \
+    --config /opt/opensips-teams-sbc/tls-rotation/rotation.conf rotate

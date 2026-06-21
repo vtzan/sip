@@ -33,8 +33,9 @@ auto_aliases=no
 
 mpath="M_MODULES_PATH"
 
-####### Modules (load order matters: tls_mgm before proto_tls) #########
+####### Modules (load order matters: db_mysql + tls_mgm before proto_tls) #########
 
+loadmodule "M_DB_MODULE"
 loadmodule "proto_udp.so"
 loadmodule "proto_tcp.so"
 loadmodule "tls_mgm.so"
@@ -46,6 +47,7 @@ loadmodule "rr.so"
 loadmodule "maxfwd.so"
 loadmodule "sipmsgops.so"
 loadmodule "uac.so"
+loadmodule "domain.so"
 loadmodule "dialog.so"
 loadmodule "rtpengine.so"
 loadmodule "htable.so"
@@ -78,34 +80,24 @@ modparam("uac", "restore_mode", "auto")
 modparam("rtpengine", "rtpengine_sock", "M_RTPENGINE_SOCK")
 modparam("rtpengine", "rtpengine_disable_tout", 20)
 
-# ---- in-memory tenant maps ----
-modparam("htable", "htable", "tenant_trunk=>size=M_HTABLE_SIZE;")
+# ---- in-memory map: carrier source IP -> tenant FQDN (outbound branding) ----
 modparam("htable", "htable", "carrier_src=>size=M_HTABLE_SIZE;")
 
-# ---- TLS: mutual authentication with Microsoft ----
+# ---- TLS: ALL certificates/domains are managed in the database (tls_mgm) ----
+# Server + client TLS domains live in the `tls_mgm` table. Certificates, keys
+# and CA chains are stored as BLOBs and rotated by tls-rotation/manage-tls.py,
+# which hot-reloads them with:  opensips-cli -x mi tls_mgm:reload
 modparam("tls_mgm", "tls_library", "openssl")
+modparam("tls_mgm", "db_url",   "M_DB_URL")
+modparam("tls_mgm", "db_table", "M_TLS_DB_TABLE")
 
-# Server domain: terminates the inbound TLS from Teams on the 5560 socket.
-# require_cert + verify_cert => Microsoft MUST present a cert chaining to ca_list.
-modparam("tls_mgm", "server_domain", "teams_srv")
-modparam("tls_mgm", "match_ip_address", "[teams_srv]M_TEAMS_TLS_LISTEN_IP:M_TEAMS_TLS_PORT")
-modparam("tls_mgm", "tls_method",       "[teams_srv]M_TLS_METHOD")
-modparam("tls_mgm", "certificate",      "[teams_srv]M_TLS_CERT")
-modparam("tls_mgm", "private_key",      "[teams_srv]M_TLS_KEY")
-modparam("tls_mgm", "ca_list",          "[teams_srv]M_TLS_CA")
-modparam("tls_mgm", "verify_cert",      "[teams_srv]1")
-modparam("tls_mgm", "require_cert",     "[teams_srv]1")
-modparam("tls_mgm", "ciphers_list",     "[teams_srv]M_TLS_CIPHERS")
-
-# Client domain: the SBC-initiated TLS toward the Microsoft proxies (outbound).
-# Presents the SBC certificate and verifies the Microsoft server certificate.
-modparam("tls_mgm", "client_domain", "teams_cli")
-modparam("tls_mgm", "match_ip_address", "[teams_cli]0.0.0.0/0")
-modparam("tls_mgm", "tls_method",       "[teams_cli]M_TLS_METHOD")
-modparam("tls_mgm", "certificate",      "[teams_cli]M_TLS_CERT")
-modparam("tls_mgm", "private_key",      "[teams_cli]M_TLS_KEY")
-modparam("tls_mgm", "ca_list",          "[teams_cli]M_TLS_CA")
-modparam("tls_mgm", "verify_cert",      "[teams_cli]1")
+# ---- domain: the authoritative list of allowed tenant domains ----
+# Each tenant FQDN is a row in the `domain` table; its `attrs` column holds the
+# carrier trunk SIP URI used for inbound (Teams -> carrier) routing.
+# db_mode=1 caches the table; reload with:  opensips-cli -x mi domain:reload
+modparam("domain", "db_url",       "M_DB_URL")
+modparam("domain", "db_mode",      M_DOMAIN_DB_MODE)
+modparam("domain", "domain_table", "M_DOMAIN_TABLE")
 
 ####### Listening sockets #########
 # TLS is exposed ONLY on 5560 (Teams). Carrier leg is plain UDP/TCP on 5060.
@@ -113,10 +105,13 @@ socket=tls:M_TEAMS_TLS_LISTEN_IP:M_TEAMS_TLS_PORT as M_TEAMS_TLS_ADVERTISED_IP:M
 socket=udp:M_CARRIER_LISTEN_IP:M_CARRIER_SIP_PORT as M_CARRIER_ADVERTISED_IP:M_CARRIER_SIP_PORT
 socket=tcp:M_CARRIER_LISTEN_IP:M_CARRIER_SIP_PORT as M_CARRIER_ADVERTISED_IP:M_CARRIER_SIP_PORT
 
-####### Startup: provision tenants #########
+####### Startup: provision carrier source IPs #########
+# Tenant domains + inbound trunks live in the DB `domain` table.
+# Only the reverse map (carrier source IP -> tenant FQDN), used to brand
+# outbound calls towards Teams, is kept in this in-memory table.
 startup_route {
-	xlog("L_INFO", "[teams-sbc] provisioning tenants (env=M_DEPLOY_ENV, base=M_TEAMS_TENANT_BASE_DOMAIN)\n");
-	M_TENANT_PROVISIONING
+	xlog("L_INFO", "[teams-sbc] provisioning carrier sources (env=M_DEPLOY_ENV, base=M_TEAMS_TENANT_BASE_DOMAIN)\n");
+	M_CARRIER_SRC_PROVISIONING
 }
 
 ####### Main request routing #########
@@ -213,21 +208,20 @@ route[TEAMS_OPTIONS_KEEPALIVE] {
 #  INBOUND  :  Teams  -->  SBC  -->  carrier
 # ---------------------------------------------------------------------------
 route[FROM_TEAMS_TO_CARRIER] {
-	# Tenant identity = host part of the Request-URI (the tenant FQDN that
-	# Microsoft was configured to send to).
-	if (!($rd =~ "M_TENANT_HOST_REGEX")) {
-		xlog("L_WARN", "[teams-sbc] inbound INVITE for unknown domain $rd\n");
+	# Tenant identity = host of the Request-URI (the tenant FQDN Microsoft sends
+	# to). Validate it against the DB `domain` table and pull the carrier trunk
+	# SIP URI from that domain's `attrs` column in one lookup.
+	if (!is_uri_host_local($var(trunk))) {
+		xlog("L_WARN", "[teams-sbc] inbound INVITE for non-local tenant domain $rd\n");
 		send_reply(404, "Unknown Tenant Domain");
 		exit;
 	}
-	$avp(tenant_fqdn) = $rd;
-
-	$var(trunk) = $sht(tenant_trunk=>$rd);
-	if ($var(trunk) == NULL) {
-		xlog("L_WARN", "[teams-sbc] no trunk provisioned for tenant $rd\n");
+	if ($var(trunk) == NULL || $var(trunk) == "") {
+		xlog("L_WARN", "[teams-sbc] no trunk (domain.attrs) provisioned for tenant $rd\n");
 		send_reply(404, "Tenant Not Provisioned");
 		exit;
 	}
+	$avp(tenant_fqdn) = $rd;
 	$avp(direction) = "in";
 
 	xlog("L_INFO", "[teams-sbc] IN  $ci tenant=$rd $fU -> $rU via $var(trunk)\n");
@@ -262,6 +256,13 @@ route[FROM_TEAMS_TO_CARRIER] {
 route[FROM_CARRIER_TO_TEAMS] {
 	$avp(tenant_fqdn) = $sht(carrier_src=>$si);
 	$avp(direction)   = "out";
+
+	# The branded tenant FQDN must be an allowed domain (DB `domain` table).
+	if (!is_domain_local("$avp(tenant_fqdn)")) {
+		xlog("L_WARN", "[teams-sbc] carrier $si mapped to non-local tenant $avp(tenant_fqdn)\n");
+		send_reply(403, "Forbidden");
+		exit;
+	}
 
 	xlog("L_INFO", "[teams-sbc] OUT $ci tenant=$avp(tenant_fqdn) $fU -> $rU to Teams\n");
 

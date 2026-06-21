@@ -16,8 +16,10 @@ for media.
 
 * **TLS is exposed on port `5560` only** (the Teams leg). No other TLS port is opened.
 * **Mutual TLS** with Microsoft (`verify_cert` + `require_cert`).
+* **All TLS certificates are managed in the database** (`tls_mgm` table) and
+  **rotated automatically** before expiry — see [`tls-rotation/`](tls-rotation/).
 * **rtpengine** bridges Teams **SRTP** (`RTP/SAVP`, SDES) ↔ carrier **RTP** (`RTP/AVP`).
-* **Full multi-tenancy** on
+* **Full multi-tenancy** — the allowed tenant domains are the DB `domain` table:
   * `‹tenant›.teams.ucp.voiceland.dev` (development)
   * `‹tenant›.teams.ucp.voiceland.global` (production)
 * Inbound (Teams → carrier) **and** outbound (carrier → Teams) calling.
@@ -32,8 +34,11 @@ for media.
 | `local.m4`                 | **All** site/module variables (edit this).                        |
 | `opensips.m4`              | OpenSIPS script template (do not edit for site values).           |
 | `Makefile`                 | Builds `opensips.cfg` and validates it.                           |
+| `sql/01-schema.sql`        | `domain` + `tls_mgm` table schema (+ version rows).               |
+| `sql/02-seed-example.sql`  | Example tenant domains and TLS rows.                              |
+| `tls-rotation/`            | DB cert management + automatic ACME rotation (systemd timer).     |
 | `rtpengine/rtpengine.conf` | Sample rtpengine config (media plane).                            |
-| `tls/README.md`            | Where to place the certificate / key / CA bundle.                 |
+| `tls/README.md`            | CA-bundle bootstrap notes (certs themselves live in the DB).      |
 | `opensips.cfg`             | **Generated** runtime config (git-ignored).                       |
 
 ---
@@ -60,20 +65,23 @@ make install    # install to /etc/opensips/opensips.cfg
 
 ## Prerequisites
 
-1. **OpenSIPS 3.6** with these modules: `proto_udp`, `proto_tcp`, `proto_tls`,
-   `tls_mgm`, `sl`, `tm`, `signaling`, `rr`, `maxfwd`, `sipmsgops`, `uac`,
-   `dialog`, `rtpengine`, `htable`, `mi_fifo`.
-2. **rtpengine** running and reachable on the control socket configured in
+1. **OpenSIPS 3.6** with these modules: `db_mysql` (or `db_postgres`),
+   `proto_udp`, `proto_tcp`, `proto_tls`, `tls_mgm`, `sl`, `tm`, `signaling`,
+   `rr`, `maxfwd`, `sipmsgops`, `uac`, `domain`, `dialog`, `rtpengine`,
+   `htable`, `mi_fifo`.
+2. **MySQL/MariaDB** (or PostgreSQL) reachable at `M_DB_URL`, with the schema
+   from [`sql/01-schema.sql`](sql/01-schema.sql) applied.
+3. **rtpengine** running and reachable on the control socket configured in
    `M_RTPENGINE_SOCK` (default `udp:127.0.0.1:2223`).
-3. A **public-CA TLS certificate** covering your tenant FQDNs (a wildcard works
-   best). See [`tls/README.md`](tls/README.md).
-4. **DNS**: every tenant FQDN (`tenant.teams.ucp.voiceland.dev`/`.global`) and
+4. A **public-CA TLS certificate** covering your tenant FQDNs (a wildcard works
+   best), issued/rotated into the DB by [`tls-rotation/`](tls-rotation/).
+5. **DNS**: every tenant FQDN (`tenant.teams.ucp.voiceland.dev`/`.global`) and
    the base OPTIONS FQDN must resolve (publicly) to the SBC public IP
    (`M_TEAMS_TLS_ADVERTISED_IP`).
-5. **Firewall**: allow inbound TLS `5560/tcp` and rtpengine's media UDP range
+6. **Firewall**: allow inbound TLS `5560/tcp` and rtpengine's media UDP range
    from the Microsoft signalling/media subnets (`52.112.0.0/14`,
    `52.120.0.0/14`, `52.122.0.0/14`).
-6. **Microsoft 365 / Teams admin**: each tenant FQDN registered as a PSTN
+7. **Microsoft 365 / Teams admin**: each tenant FQDN registered as a PSTN
    gateway (`New-CsOnlinePSTNGateway -Fqdn tenant.teams.ucp.voiceland.dev
    -SipSignalingPort 5560 -Enabled $true`) with the matching voice route /
    PSTN usage / voice-routing policy.
@@ -90,28 +98,33 @@ Edit the variables grouped by section. The most important ones:
 | `M_TEAMS_TENANT_BASE_DOMAIN`   | `teams.ucp.voiceland.dev` (dev) / `…global` (prod).           |
 | `M_TEAMS_TLS_LISTEN_IP` / `…_ADVERTISED_IP` | bind IP vs. public IP for the Teams leg.         |
 | `M_CARRIER_LISTEN_IP` / `…_ADVERTISED_IP` / `…_SIP_PORT` | the carrier/core leg.            |
-| `M_TLS_CERT` / `M_TLS_KEY` / `M_TLS_CA` | certificate, key, and trust chain for Microsoft.     |
+| `M_DB_URL` / `M_DB_MODULE`     | database connection (shared by `tls_mgm` + `domain`).         |
 | `M_RTPENGINE_SOCK`             | rtpengine ng control socket.                                  |
-| `M_TENANT_PROVISIONING`        | the tenant → trunk and carrier-IP → tenant maps.              |
+| `M_CARRIER_SRC_PROVISIONING`   | the carrier-IP → tenant FQDN map (outbound branding).         |
 
 ### Tenant provisioning
 
-Each tenant needs two lines inside `M_TENANT_PROVISIONING` (the base domain is
-appended automatically):
+A tenant is provisioned in two places:
 
-```m4
-$sht(tenant_trunk=>acme.M_TEAMS_TENANT_BASE_DOMAIN) = "sip:198.51.100.10:5060;transport=udp";
-$sht(carrier_src=>198.51.100.10)                    = "acme.M_TEAMS_TENANT_BASE_DOMAIN";
-```
+1. **Database `domain` table** (the allowed-domains list). The `attrs` column
+   holds the inbound carrier trunk SIP URI — this is where calls **from Teams**
+   for that tenant are sent. See [`sql/02-seed-example.sql`](sql/02-seed-example.sql):
 
-* `tenant_trunk` — where calls **from Teams** for this tenant are sent (the
-  carrier `$du`).
-* `carrier_src` — maps the **carrier source IP** of inbound trunk traffic back
-  to the tenant FQDN, used to brand outbound calls **to Teams**.
+   ```sql
+   INSERT INTO domain (domain, attrs, accept_subdomain, last_modified) VALUES
+     ('acme.teams.ucp.voiceland.dev', 'sip:198.51.100.10:5060', 0, NOW());
+   ```
+   Reload live with `opensips-cli -x mi domain:reload`.
 
-These maps are loaded once in the `startup_route`. For large/dynamic fleets,
-swap the htable for a DB-backed lookup (`sqlops`/`cachedb_*`) without touching
-the routing logic.
+2. **`M_CARRIER_SRC_PROVISIONING` in `local.m4`** — the reverse map (carrier
+   source IP → tenant FQDN) used to brand **outbound** calls to Teams:
+
+   ```m4
+   $sht(carrier_src=>198.51.100.10) = "acme.M_TEAMS_TENANT_BASE_DOMAIN";
+   ```
+
+The SBC validates every tenant domain against the `domain` table at call time
+(`is_uri_host_local` / `is_domain_local`).
 
 ---
 
@@ -119,8 +132,8 @@ the routing logic.
 
 ### Inbound — Teams → carrier
 1. INVITE arrives over TLS/5560 from a Microsoft subnet (`IS_FROM_TEAMS`).
-2. Tenant = host of the Request-URI; validated against `M_TENANT_HOST_REGEX`
-   and looked up in `tenant_trunk`.
+2. Tenant = host of the Request-URI; validated against the DB `domain` table
+   with `is_uri_host_local()`, which also returns the carrier trunk (`attrs`).
 3. `Contact` rewritten to the SBC carrier address; **double Record-Route**
    places the **tenant FQDN** on the Teams side and the SBC IP on the carrier side.
 4. `rtpengine_offer` converts the Teams **SRTP** offer to carrier **RTP**.
@@ -155,6 +168,35 @@ collapse every tenant onto one trunk.
 
 ---
 
+## Database & certificate management
+
+TLS certificates and the allowed-domains list are **in the database**:
+
+| Table     | Holds                                                              | Live reload |
+|-----------|-------------------------------------------------------------------|-------------|
+| `tls_mgm` | Server/client TLS domains + certificate/key/CA chains (BLOB).     | `tls_mgm:reload` |
+| `domain`  | Allowed tenant FQDNs; `attrs` = inbound carrier trunk URI.        | `domain:reload`  |
+
+```bash
+mysql opensips < sql/01-schema.sql            # tables + version rows
+mysql opensips < sql/02-seed-example.sql      # your tenants + TLS rows
+opensips-cli -x mi domain:reload
+```
+
+**Automatic certificate rotation** (issue/renew before expiry, write to DB,
+hot-reload) is handled by [`tls-rotation/`](tls-rotation/) via a daily systemd
+timer:
+
+```bash
+python3 tls-rotation/manage-tls.py check      # show expiry of every cert
+python3 tls-rotation/manage-tls.py rotate     # renew anything within 30 days
+```
+
+See [`tls-rotation/README.md`](tls-rotation/README.md) for the full bootstrap
+and the systemd timer install.
+
+---
+
 ## Validate & run
 
 ```bash
@@ -167,7 +209,8 @@ Health checks:
 ```bash
 opensips-cli -x mi ps                       # processes
 opensips-cli -x mi get_statistics dialog:   # active dialogs
-opensips-cli -x mi rtpengine_show all       # rtpengine nodes (if MI exposed)
+opensips-cli -x mi tls_mgm:reload           # reload certs from DB
+opensips-cli -x mi domain:reload            # reload allowed domains from DB
 ```
 
 ---
@@ -175,11 +218,13 @@ opensips-cli -x mi rtpengine_show all       # rtpengine nodes (if MI exposed)
 ## Security notes
 
 * The primary trust boundary is **mutual TLS** on 5560 — only a peer presenting
-  a certificate that chains to `M_TLS_CA` can connect. The Microsoft source-IP
-  regex (`M_TEAMS_SRC_IP_REGEX`) is defence-in-depth; keep it current with
-  Microsoft's published ranges.
-* Carrier-side INVITEs are accepted **only** from IPs present in `carrier_src`.
-* Private keys must never be committed (see `.gitignore` / `tls/.gitignore`).
+  a certificate that chains to the `tls_mgm.ca_list` bundle can connect. The
+  Microsoft source-IP regex (`M_TEAMS_SRC_IP_REGEX`) is defence-in-depth; keep
+  it current with Microsoft's published ranges.
+* Carrier-side INVITEs are accepted **only** from IPs present in `carrier_src`,
+  and the resolved tenant must exist in the `domain` table.
+* Private keys live in the DB (and never in git); `rotation.conf` (DB password)
+  is git-ignored.
 
 ---
 

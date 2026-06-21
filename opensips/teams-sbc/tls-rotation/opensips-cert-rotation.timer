@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily TLS certificate rotation for the OpenSIPS Teams SBC
+
+[Timer]
+# Run once a day with up to an hour of jitter; catch up if the box was off.
+OnCalendar=daily
+RandomizedDelaySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,28 @@
+# Copy to rotation.conf and fill in. rotation.conf is git-ignored (it holds the
+# DB password). Used by manage-tls.py.
+
+[db]
+host     = 127.0.0.1
+port     = 3306
+user     = opensips
+password = opensipsrw
+name     = opensips
+table    = tls_mgm
+
+[rotation]
+# Renew when the leaf certificate has this many days (or fewer) left.
+renew_threshold_days = 30
+# How manage-tls.py reaches OpenSIPS MI to hot-reload (opensips-cli must be
+# configured to talk to this instance via fifo or http).
+opensips_cli = opensips-cli
+
+[acme]
+# Hook that issues/renews a certificate for a set of SANs (see acme-hook.sh).
+hook = /opt/opensips-teams-sbc/tls-rotation/acme-hook.sh
+
+# Map a tls_mgm.domain id -> the SAN list to request for it.
+# Wildcards cover every tenant under a base domain with a single certificate.
+# (Rows that instead set tls_mgm.match_sip_domain are auto-issued for that FQDN.)
+[map]
+teams_srv = *.teams.ucp.voiceland.dev,*.teams.ucp.voiceland.global,sbc.teams.ucp.voiceland.dev
+teams_cli = sbc.teams.ucp.voiceland.dev

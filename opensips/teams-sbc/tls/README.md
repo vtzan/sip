@@ -1,30 +1,34 @@
 # TLS material
 
-Place the certificate/key referenced by `local.m4` here (paths are configurable):
+> **Certificates are now managed in the database** (`tls_mgm` table), not in
+> files. See [`../tls-rotation/`](../tls-rotation/). This directory is only a
+> scratch area for the ACME client (lego) output and the CA bundle you import.
 
-| local.m4 variable | default file                         | contents                                            |
-|-------------------|--------------------------------------|-----------------------------------------------------|
-| `M_TLS_CERT`      | `wildcard.crt.pem`                   | SBC server/client certificate (PEM, full chain)     |
-| `M_TLS_KEY`       | `wildcard.key.pem`                   | private key (PEM, **never commit**)                 |
-| `M_TLS_CA`        | `ca-bundle.pem`                      | public root/intermediate chain that signs the Microsoft SIP proxy cert |
+## What lives where
+
+| Item                         | Location                                                        |
+|------------------------------|----------------------------------------------------------------|
+| SBC certificate + private key| `tls_mgm.certificate` / `tls_mgm.private_key` (BLOB)            |
+| Peer-verification CA bundle  | `tls_mgm.ca_list` (BLOB) — set with `manage-tls.py set-ca`     |
+| Issuance / renewal           | `tls-rotation/manage-tls.py rotate` (ACME, daily systemd timer)|
 
 ## Certificate requirements (Microsoft Teams Direct Routing)
 
-- Issued by a [Microsoft-supported public CA](https://learn.microsoft.com/en-us/microsoftteams/direct-routing-plan#supported-session-border-controllers-sbcs)
-  (e.g. DigiCert). Self-signed certificates are rejected.
-- Subject / SAN must cover the tenant FQDNs the SBC presents. A wildcard works:
+- Issued by a [Microsoft-supported public CA](https://learn.microsoft.com/en-us/microsoftteams/direct-routing-plan#supported-session-border-controllers-sbcs).
+- Subject/SAN must cover the tenant FQDNs the SBC presents. A wildcard works:
   - dev:  `*.teams.ucp.voiceland.dev`
   - prod: `*.teams.ucp.voiceland.global`
   - plus the base OPTIONS FQDN, e.g. `sbc.teams.ucp.voiceland.dev`
-- TLS 1.2 (the config negotiates `TLSv1_2+`).
-- The **same** cert/key is used for the inbound TLS server (port 5560) and the
-  outbound TLS client connections to `sip*.pstnhub.microsoft.com`.
+- TLS 1.2 (the `tls_mgm` rows negotiate `TLSv1_2+`).
 
-`ca-bundle.pem` must let OpenSIPS verify Microsoft's certificate (mutual TLS,
-`require_cert`/`verify_cert` are enabled). The system CA bundle generally works:
+## Bootstrapping the CA bundle
 
-```
-cp /etc/ssl/certs/ca-certificates.crt ca-bundle.pem   # Debian/Ubuntu
+`ca_list` must let OpenSIPS verify the **Microsoft** peer certificate (mutual
+TLS). The system bundle generally works:
+
+```bash
+cp /etc/ssl/certs/ca-certificates.crt ca-bundle.pem     # Debian/Ubuntu
+python3 ../tls-rotation/manage-tls.py set-ca --ca ca-bundle.pem
 ```
 
 Files in this directory matching `*.pem`, `*.key`, `*.crt`, `*.p12`, `*.pfx`
